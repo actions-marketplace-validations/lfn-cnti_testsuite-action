@@ -71,12 +71,16 @@ Existing cluster (self-hosted runner with `$KUBECONFIG` set):
 | `install_timeout` | | Seconds to wait for the CNF during `cnf_install` (`--timeout`) |
 | `create_kind_cluster` | `true` | Create a kind cluster; `false` uses `$KUBECONFIG` |
 | `kind_config` | | Custom kind config (default: 1 control-plane + 2 workers) |
+| `kind_shared_storage` | `true` | Give the kind cluster volumes that follow a pod to another node (see [Storage](#storage)); `false` keeps kind's node-local volumes |
 | `kind_version` | | kind version; empty uses the [helm/kind-action](https://github.com/helm/kind-action) default |
 | `kind_load_images` | | Local Docker images to load into the kind cluster (whitespace-separated) |
 | `fail_on_failure` | `true` | Fail the job when the run exits non-zero |
+| `expected_results` | | A YAML list of the results you know and accept (`{test, status, reason}`); every test that differs is reported (see [Expected results](#expected-results)) |
+| `on_regression` | `warn` | `fail` fails the job on a regression against `expected_results`, after the badge is published |
 | `upload_results` | `true` | Upload `cnti/results/` and `cnti/evidence/` as an artifact: every run's full evidence is downloadable from the run page, whether or not a badge or an evidence repository is set |
 | `artifact_name` | `cnti-testsuite-results` | Artifact name |
 | `badge_branch` | | Publish `cnti-badge.svg`/`.json` to this orphan branch with `GITHUB_TOKEN` (needs `permissions: contents: write`); default branch only |
+| `badge_name` | | With `badge_branch`: publish to `<badge_name>/` on the branch and keep the rest of it, so several CNFs of one repository share one badge branch (see [Several CNFs in one repository](#several-cnfs-in-one-repository)) |
 | `gist_badge_id` | | Optional gist ID for a results badge on another repository |
 | `gist_badge_secret` | | Token with `gist` scope |
 | `gist_badge_filename` | `cnti_badge.json` | Badge file name in the gist |
@@ -94,6 +98,7 @@ One of `cnf_config` or `helm_chart_dir` is required.
 | `points` / `maximum_points` | Points scored / maximum |
 | `criteria` | Pass criterion of the run as compact JSON (e.g. the essential-tests threshold of `cert`); empty when the task has none |
 | `results_file` | Path to the results YAML |
+| `regressions` / `improvements` / `changed` | Comma-separated tests that differ from `expected_results`: failed or errored though expected to pass, skip or be n/a; passed though listed as not passing; any difference |
 
 ```yaml
 - uses: lfn-cnti/testsuite-action@v1
@@ -125,6 +130,33 @@ permissions:
 
 The badge shows the CNTi logo, the test set and the result, e.g. `CNTi essential 16/19` (tests passed / maximum for the task that ran; the `cert` task's set is named `essential`, any other task by its name), green when the run met its objective. It is written by the suite itself (`cnti-testsuite evidence`, v2.3.0 or newer), so every CI system gets the same badge. Pull requests never
 touch the badge; only runs on the default branch publish it.
+
+### Several CNFs in one repository
+
+Without `badge_name` the branch holds one badge, and every run replaces the branch. When one
+repository tests several CNFs (a chart per network function, say), give each its own
+`badge_name`: the badge goes to `<badge_name>/` on the shared branch, the other CNFs' badges
+stay, and the branch is still a single commit. Jobs that publish at the same time retry, up to
+five attempts each; a job that loses every attempt warns and leaves its previous badge in place.
+
+```yaml
+strategy:
+  matrix:
+    cnf: [gnb, du]
+steps:
+  - uses: lfn-cnti/testsuite-action@v1
+    with:
+      cnf_config: cnti/${{ matrix.cnf }}/cnti-testsuite.yaml
+      badge_branch: badges
+      badge_name: ${{ matrix.cnf }}
+```
+
+```markdown
+![CNTi essential](https://github.com/<owner>/<repo>/raw/badges/gnb/cnti-badge.svg)
+```
+
+Use `badge_name` for every CNF that publishes to the branch: a run without it replaces the
+whole branch.
 
 ### Without write access to the repository
 
@@ -265,6 +297,98 @@ access can pull the attestation. The statement records the reference in
 GitHub attestations were made too, which it then keeps. The reference is recorded before anything signs
 the statement, so the bundle's statement is the one both signatures cover; if attaching fails,
 the reference is taken out again.
+
+## Storage
+
+kind's default StorageClass (`standard`, from local-path-provisioner) keeps each volume on the
+node that created it, and the volume's node affinity pins its pod there. When `node_drain`
+drains that node, a StatefulSet's pod can never start elsewhere, whatever the CNF does; on a
+cluster with network storage the same CNF passes.
+
+So the action mounts one directory on every kind node and switches the provisioner to its
+shared mode: volumes have no node affinity, and a drained pod starts on another node with its
+data. The StorageClass keeps its name and stays the default, so CNF configurations don't
+change. `kind_shared_storage: false` turns this off.
+
+- **Where the data lives:** a Docker volume labelled `org.lfn-cnti.testsuite-action=kind-storage`,
+  on the Docker host and readable by root only. On a reused self-hosted runner, the next run of
+  the action removes the volumes of earlier runs, provided their kind cluster is gone (the
+  cluster the action creates is deleted when the job ends; one left behind keeps its volumes).
+- **A `kind_config` of your own** gets the same mount on every node. If it already mounts
+  `/var/local-path-provisioner` on any node, the action leaves its storage alone, the
+  provisioner included: mount one shared directory there on every node and configure the
+  provisioner as shown below.
+- **Older kind node images** whose provisioner has no shared mode keep node-local volumes; the
+  action says so with a warning.
+
+The shared volumes behave like file storage that every node reaches at once (NFS, CephFS), not
+like block storage that attaches to one node at a time: a `ReadWriteOnce` volume can be used on
+two nodes together. A Deployment's rolling update with such a volume starts here where block
+storage would stop it with a multi-attach error; `node_drain` judges whether pods move, not how
+the storage attaches.
+
+With `create_kind_cluster: false` and a kind cluster of your own, the same takes a mount on
+every node and three commands after `kind create cluster`:
+
+```yaml
+nodes:
+  - role: control-plane
+    extraMounts: &shared-storage
+      - hostPath: /tmp/kind-shared-storage   # one runner directory for all nodes
+        containerPath: /var/local-path-provisioner
+  - role: worker
+    extraMounts: *shared-storage
+```
+
+```bash
+kubectl -n local-path-storage patch configmap local-path-config --type merge -p \
+  '{"data":{"config.json":"{\"nodePathMap\":[],\"sharedFileSystemPath\":\"/var/local-path-provisioner\"}"}}'
+kubectl -n local-path-storage rollout restart deployment local-path-provisioner
+kubectl -n local-path-storage rollout status deployment local-path-provisioner
+```
+
+## Expected results
+
+The badge says whether the essential tests passed, not when something changed while they still
+pass: a chart at 16 of 19 that drops to 15, or a test that starts failing while another starts
+passing, keeps the same badge. List the results you know and accept in a file in your repository,
+and the action tells you when a run differs from it:
+
+```yaml
+# .github/cnti/expected.yaml
+- test: hostpath_mounts
+  status: failed
+  reason: /sys/fs/bpf from the node is required by the non-root design
+- test: specialized_init_system
+  status: failed
+  reason: no init in the image yet
+```
+
+```yaml
+- uses: lfn-cnti/testsuite-action@v1
+  with:
+    cnf_config: cnti-testsuite.yaml
+    expected_results: .github/cnti/expected.yaml
+```
+
+A test the file doesn't list is expected to pass. Every test whose result differs from the file is
+in the job summary, as a warning, and in the outputs:
+
+- **a regression**: it failed or errored, though expected to pass, be skipped or be n/a;
+- **an improvement**: it passed, though listed as not passing. Remove its entry, so the file stays
+  the record: a chart fix or a suite upgrade that changes a result updates the file in the same
+  pull request;
+- **changed**: any difference, those two included (`failed` to `error`, `skipped` to `na`, ...).
+
+Entries for tests the run didn't include are ignored, so one file serves a `cert` run and a
+`workload` run. `on_regression: fail` fails the job when there is a regression, after the badge
+and the evidence are published: the badge still says what the run scored, and GitHub emails the
+workflow's owner about the failed run. The badge itself never changes. A file that can't be read
+is a warning, and the results are then not compared.
+
+The suite does the comparison (`cnti-testsuite compare`, so the GitLab component and a local run
+read the file the same way): `expected_results` needs a cnti-testsuite with `compare`
+(lfn-cnti/testsuite#2872). With an older one it is a warning, and nothing is compared.
 
 ## Requirements
 
