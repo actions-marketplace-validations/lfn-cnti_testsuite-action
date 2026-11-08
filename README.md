@@ -6,7 +6,7 @@ cloud native best practices.
 
 By default the action creates a 3-node [kind](https://kind.sigs.k8s.io/) cluster, installs the
 latest `cnti-testsuite` release (v2.0.0 or newer), deploys your CNF and runs the essential test set (the `cert` task).
-It writes a job summary, annotates failed tests, uploads the results and the evidence bundle as an artifact and
+It writes a job summary, annotates failed tests, uploads the results and the evidence bundle as an artifact, and the evidence bundle alone as a second one, and
 fails the job when the CNF does not meet the objective of the run (for the essential tests: 15 of 19 passed).
 
 ## Usage
@@ -60,8 +60,8 @@ Existing cluster (self-hosted runner with `$KUBECONFIG` set):
 |---|---|---|
 | `version` | `latest` | cnti-testsuite release tag, e.g. `v2.0.0` (v2.0.0 or newer; the badge and the evidence need v2.3.0 or newer, and a run that asks for them with an older suite fails) |
 | `binary_url` | | URL of a release tarball to install instead of `version`, e.g. a prerelease on a fork, to try a build before its release |
-| `attest` | `false` | attest the results file with GitHub artifact attestations, from the default branch (needs `id-token: write`, `attestations: write`) |
-| `evidence_oci_ref` | | chart or image reference in a registry to attach the signed evidence to (cosign attestation, keyless), from the default branch (needs `id-token: write` and push access) |
+| `attest` | `false` | attest the results file with GitHub artifact attestations, from the default branch and a run that reached a verdict (needs `id-token: write`, `attestations: write`) |
+| `evidence_oci_ref` | | chart or image reference in a registry to attach the signed evidence to (cosign attestation, keyless), from the default branch and a run that reached a verdict (needs `id-token: write` and push access) |
 | `evidence_oci_token`, `evidence_oci_username` | the job's token, the actor | registry login for `evidence_oci_ref`; the defaults work for ghcr.io with `packages: write` |
 | `cnf_config` | | Path to a `cnti-testsuite.yaml`; takes precedence over `helm_chart_dir` |
 | `helm_chart_dir` | | Local Helm chart directory; a minimal config is generated |
@@ -86,8 +86,9 @@ Existing cluster (self-hosted runner with `$KUBECONFIG` set):
 | `analyze_comment` | `false` | Also post the analysis on the pull request (needs `pull-requests: write`) |
 | `expected_results` | | A YAML list of the results you know and accept (`{test, status, reason}`); every test that differs is reported (see [Expected results](#expected-results)) |
 | `on_regression` | `warn` | `fail` fails the job on a regression against `expected_results`, after the badge is published |
-| `upload_results` | `true` | Upload `cnti/results/` and `cnti/evidence/` as an artifact: every run's full evidence is downloadable from the run page, whether or not a badge or an evidence repository is set |
+| `upload_results` | `true` | Upload `cnti/results/` and `cnti/evidence/` as an artifact: every run's full evidence is downloadable from the run page, whether or not a badge or an evidence repository is set; and `cnti/evidence/` alone as a second artifact (`evidence_artifact_name`) |
 | `artifact_name` | `cnti-testsuite-results` | Artifact name |
+| `evidence_artifact_name` | `cnti-evidence` while `artifact_name` is `cnti-testsuite-results`, otherwise `<artifact_name>-evidence` | Name of a second artifact with the evidence bundle alone, without the logs and diagnostics, from a run that reached a verdict once its statement is complete (otherwise the evidence stays in the results artifact only); must differ from `artifact_name` |
 | `badge_branch` | | Publish `cnti-badge.svg`/`.json` to this orphan branch with `GITHUB_TOKEN` (needs `permissions: contents: write`); default branch only |
 | `badge_name` | | With `badge_branch`: publish to `<badge_name>/` on the branch and keep the rest of it, so several CNFs of one repository share one badge branch (see [Several CNFs in one repository](#several-cnfs-in-one-repository)) |
 | `gist_badge_id` | | Optional gist ID for a results badge on another repository |
@@ -107,6 +108,7 @@ One of `cnf_config` or `helm_chart_dir` is required.
 | `points` / `maximum_points` | Points scored / maximum |
 | `criteria` | Pass criterion of the run as compact JSON (e.g. the essential-tests threshold of `cert`); empty when the task has none |
 | `results_file` | Path to the results YAML |
+| `config_error` | Set when the action refused its inputs before the run: `artifact_names` (`artifact_name` empty, or `evidence_artifact_name` equal to it); empty otherwise |
 | `regressions` / `improvements` / `changed` | Comma-separated tests that differ from `expected_results`: failed or errored though expected to pass, skip or be n/a; passed though listed as not passing; any difference |
 
 ```yaml
@@ -208,7 +210,9 @@ repository you own, from runs of the default branch, with history:
   date, and the names of the files published and withheld;
 - `config/`: the `cnti-testsuite.yaml` the CNF was installed from and every values file it names,
   bundled by the suite itself, so a reader sees what was set on top of the chart's defaults;
-- any extra files you name in `evidence_files` (a README of the test setup, say).
+- any extra files you name in `evidence_files` (a README of the test setup, say), at their paths
+  in the workspace; an entry outside the workspace (a symlink to a target outside it too), or one
+  that would replace a file of the bundle above, is skipped with a warning.
 
 The bundle comes from the suite's own `cnti-testsuite evidence` (v2.3.0 or newer). Never published: the suite's
 logs (they stay in the job's artifact) and any file whose name matches `evidence_exclude`
@@ -241,7 +245,13 @@ public page:
 With `attest: "true"` the action attests the results file with
 [GitHub artifact attestations](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations):
 the statement's Test Result predicate, signed with the workflow's identity and stored by GitHub.
-A reader of the published bundle verifies it without access to your repository:
+As with the badge and the published bundle, only a run of the default branch that reached a
+verdict (exit code 0 or 1) is attested, here and in a registry (`evidence_oci_ref`): an errored or
+aborted run is not signed, and where it would have been (the default branch, with the evidence
+written) a notice says why. Verifying fetches the attestation from the
+repository that ran the job, so a reader needs read access to it: for a public repository that is
+anyone; for a private one, the published bundle alone does not carry the attestation (attach the
+evidence to a public chart in a registry with `evidence_oci_ref` for that):
 
 ```
 gh attestation verify cnti-testsuite-results-<timestamp>.yml \\
@@ -423,6 +433,14 @@ With `openai-compatible`, `analyze_endpoint` points at any server that speaks
 `/chat/completions`: a hosted service, or one of your own (Ollama, llama.cpp, vLLM), which needs
 no key and is the choice for code whose data must not leave your network. The self-test runs it
 against a small model in Ollama on the runner.
+
+Pick the model for the reading, not for the runner: a model of roughly 7B parameters or more, or a
+hosted one. A very small model keeps to the answer's format but misreads the facts of a real CNF:
+on the adopters' failures, a 1.5B model named tests that were never sent and left out the ones that
+were. The analysis flags part of it: a cause whose cited IDs are none of the recorded facts is
+marked unsupported, with low confidence, and a test the answer leaves out is named. It does not
+check that a cited fact supports the cause, so read the facts each cause cites before acting on it.
+The self-test's 1.5B model checks the plumbing only.
 
 - **When:** whenever a test failed or errored, also in a run that met its pass mark (a `cert`
   run at 16 of 19 has three failures worth reading), and only where the key is

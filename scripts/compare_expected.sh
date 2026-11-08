@@ -22,17 +22,22 @@ trap 'rm -rf "$work"' EXIT
 
 args=(compare --results-file "$RESULTS_FILE" --expected "$EXPECTED_RESULTS")
 if ! cnti-testsuite "${args[@]}" --output json > "$work/report.json" 2> "$work/err"; then
-  if ! cnti-testsuite help 2>/dev/null | grep -qw compare; then
+  if ! cnti-testsuite help 2>/dev/null | grep -w compare >/dev/null; then
     skip "this cnti-testsuite has no 'compare' (it needs v2.4.0 or later)"
   fi
   skip "cnti-testsuite compare refused: $(grep -v '^\[' "$work/err" | tail -3 | tr '\n' ' ' | head -c 400)"
 fi
 cnti-testsuite "${args[@]}" > "$work/report.md" 2> /dev/null || skip "cnti-testsuite compare could not write its report"
 
-report() { yq -p json -r "$1" "$work/report.json"; }
-report '.warnings[] | "::warning::" + .'
+report() { yq -p json -o yaml -r "$1" "$work/report.json"; }
+# An empty list still prints one empty line: skip it, rather than turn it into
+# an empty warning.
+while IFS= read -r w; do
+  [[ -n "$w" ]] && echo "::warning::$w"
+done < <(report '.warnings[]')
 # cut, not read: read would merge the tabs around an empty reason.
 while IFS= read -r line; do
+  [[ -n "$line" ]] || continue
   reason=$(cut -f5 <<< "$line")
   echo "::warning::$(cut -f1 <<< "$line"): expected $(cut -f2 <<< "$line"), now $(cut -f3 <<< "$line") ($(cut -f4 <<< "$line"))${reason:+; listed because: $reason}"
 done < <(report '.changes[] | [.test, .expected, .actual, .kind, .reason] | @tsv')
